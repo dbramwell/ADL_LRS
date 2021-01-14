@@ -1,7 +1,7 @@
 # Django settings for adl_lrs project.
 from os import path
 from os.path import dirname, abspath
-from ConfigParser import RawConfigParser
+from configparser import RawConfigParser
 
 ALLOWED_HOSTS = ['*']
 
