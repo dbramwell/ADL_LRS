@@ -1,6 +1,6 @@
 amqp==1.4.9
 bencode==1.0
-configparser=5.0.1
+configparser==5.0.1
 celery==3.1.19
 django-cors-headers==1.1.0
 django-jsonify==0.3.0
