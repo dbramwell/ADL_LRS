@@ -12,4 +12,4 @@ python-jose==0.6.1
 pytz==2015.7
 requests==2.20.0
 rfc3987==1.3.4
-supervisor==3.2.0
+supervisor==4.2.1
