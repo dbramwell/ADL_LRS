@@ -1,123 +1,147 @@
+import ast
 import json
-from datetime import datetime
-from jsonfield import JSONField
+import uuid
+from collections import OrderedDict
 
 from django_extensions.db.fields import UUIDField
 from django.conf import settings
-from django.db import models
 from django.db import transaction
 from django.utils.timezone import utc
+from django.db import models, IntegrityError
+from django.db.models.signals import post_save
+from django.contrib.auth.models import User
+from django.contrib.postgres.fields import JSONField
+from django.core.files.storage import FileSystemStorage
+from django.utils import timezone
 
 from oauth_provider.consts import MAX_URL_LENGTH
 
-from .util import util
+from .exceptions import BadRequest
+from .utils import get_lang
 
 AGENT_PROFILE_UPLOAD_TO = "agent_profile"
 ACTIVITY_STATE_UPLOAD_TO = "activity_state"
 ACTIVITY_PROFILE_UPLOAD_TO = "activity_profile"
 STATEMENT_ATTACHMENT_UPLOAD_TO = "attachment_payloads"
 
-class Verb(models.Model):
-    verb_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True, unique=True)
-    display = JSONField(default={}, blank=True)
+# Called when a user is created, saved, or logging in
 
-    def to_dict(self, lang=None):
-        ret = {}
-        ret['id'] = self.verb_id
-        if self.display:
-            ret['display'] = util.get_lang(self.display, lang)                        
+
+def attach_user(sender, **kwargs):
+    user = kwargs["instance"]
+    if kwargs["created"]:
+        agent = Agent.objects.retrieve_or_create(
+            **{'name': user.username, 'mbox': 'mailto:%s' % user.email, 'objectType': 'Agent'})[0]
+        agent.user = user
+        agent.save()
+post_save.connect(attach_user, sender=User)
+
+
+class Verb(models.Model):
+    verb_id = models.CharField(
+        max_length=MAX_URL_LENGTH, db_index=True, unique=True)
+    canonical_data = JSONField(default=dict)
+
+    def return_verb_with_lang(self, lang=None, ids_only=False):
+        if ids_only:
+            return {'id': self.verb_id}
+        ret = OrderedDict(self.canonical_data)
+        if 'display' in ret and ret['display'].items():
+            ret['display'] = get_lang(self.canonical_data['display'], lang)
         return ret
 
-    # Just return one value for human-readable
-    def get_display(self, lang=None):
-        if not self.display:
-            return self.verb_id
-        if lang:
-            return self.display[lang]
-        try:    
-            return self.display['en-US']
-        except:
-            try:
-                return self.display['en']
-            except:
-                pass
-        return self.display.values()[0]
+    def get_a_name(self):
+        if 'display' in self.canonical_data:
+            return self.canonical_data['display'].get('en-US', self.verb_id)
+        return self.verb_id
 
     def __unicode__(self):
-        return json.dumps(self.to_dict())
+        return json.dumps(self.canonical_data, sort_keys=False)
 
-agent_ifps_can_only_be_one = ['mbox', 'mbox_sha1sum', 'account', 'openid']
+
 class AgentManager(models.Manager):
-    @transaction.commit_on_success
+
+    def retrieve(self, **kwargs):
+        agent_ifps_can_only_be_one = [
+            'mbox', 'mbox_sha1sum', 'account', 'openid']
+        ifp_sent = [
+            a for a in agent_ifps_can_only_be_one if kwargs.get(a, None) is not None]
+        if ifp_sent:
+            # Get IFP
+            ifp = ifp_sent[0]
+            ifp_dict = {}
+            # If IFP is account, have to set the kwargs keys differently since they have different
+            # field names
+            if not 'account' == ifp:
+                ifp_dict[ifp] = kwargs[ifp]
+            else:
+                # Set ifp_dict and kwargs
+                ifp_dict['account_homePage'] = kwargs['account']['homePage']
+                ifp_dict['account_name'] = kwargs['account']['name']
+            try:
+                # Try getting agent by IFP in ifp_dict
+                agent = Agent.objects.filter(**ifp_dict)[0]
+                return agent
+            except IndexError:
+                return None
+        else:
+            return None
+
     def retrieve_or_create(self, **kwargs):
-        ifp_sent = [a for a in agent_ifps_can_only_be_one if kwargs.get(a, None) != None]        
+        agent_ifps_can_only_be_one = [
+            'mbox', 'mbox_sha1sum', 'account', 'openid']
+        ifp_sent = [
+            a for a in agent_ifps_can_only_be_one if kwargs.get(a, None) is not None]
         is_group = kwargs.get('objectType', None) == "Group"
         has_member = False
-        
+        # Set member if incoming group
         if is_group:
             member = kwargs.pop('member', None)
             if member:
                 has_member = True
-                if isinstance(member, basestring):
-                    member = json.loads(member)
-
+        # Create agent based on IFP
         if ifp_sent:
-            # Canonical is defaulted to true
-            canonical_version = kwargs.get('canonical_version', True)
-
+            # Get IFP
             ifp = ifp_sent[0]
-            ifp_dict = {'canonical_version': canonical_version}
-
+            ifp_dict = {}
+            # If IFP is account, have to set the kwargs keys differently since they have different
+            # field names
             if not 'account' == ifp:
                 ifp_dict[ifp] = kwargs[ifp]
             else:
-                if not isinstance(kwargs['account'], dict):
-                    account = json.loads(kwargs['account'])
-                else:
-                    account = kwargs['account']
-
-                ifp_dict['account_homePage'] = account['homePage']
-                kwargs['account_homePage'] = account['homePage']
-
-                ifp_dict['account_name'] = account['name']
-                kwargs['account_name'] = account['name']
-
+                # Set ifp_dict and kwargs
+                ifp_dict['account_homePage'] = kwargs['account']['homePage']
+                kwargs['account_homePage'] = kwargs['account']['homePage']
+                ifp_dict['account_name'] = kwargs['account']['name']
+                kwargs['account_name'] = kwargs['account']['name']
                 del kwargs['account']
-
             try:
-                if not 'account' == ifp:
-                    agent = Agent.objects.filter(**ifp_dict)[0]
-                else:
-                    agent = Agent.objects.filter(**ifp_dict)[0]
+                # Try getting agent by IFP in ifp_dict
+                agent = Agent.objects.filter(**ifp_dict)[0]
                 created = False
             except IndexError:
-                agent = Agent.objects.create(**kwargs)
-                created = True
+                # If DNE create the agent based off of kwargs (kwargs now
+                # includes account_homePage and account_name fields)
+                try:
+                    agent = Agent.objects.create(**kwargs)
+                    created = True
+                except IntegrityError, ValidationError:
+                    # Try getting agent by IFP in ifp_dict
+                    agent = Agent.objects.filter(**ifp_dict)[0]
+                    created = False
 
-            # For identified groups
+            # For identified groups with members
             if is_group and has_member:
-                members = [self.retrieve_or_create(**a) for a in member]
-
-                # If newly created identified group add all of the incoming members
+                # If newly created identified group add all of the incoming
+                # members
                 if created:
+                    members = [self.retrieve_or_create(**a) for a in member]
                     agent.member.add(*(a for a, c in members))
-
-                # If retrieving existing canonical identified group, update members if necessary
-                if not created and canonical_version:
-                    for mem in members:
-                        member_agent = mem[0]
-                        if not member_agent in agent.member.all():
-                            agent.member.add(member_agent)
-                            agent.save()
-
-            # If retreived agent or identified group is canonical version and name is different then update the name
-            if 'name' in kwargs and kwargs['name'] != agent.name and canonical_version and not created:
-                agent.name = kwargs['name']
-                agent.save()
-
+                    agent.save()
         # Only way it doesn't have IFP is if anonymous group
         else:
-            agent, created = self.retrieve_or_create_anonymous_group(member, kwargs)
+            agent, created = self.retrieve_or_create_anonymous_group(
+                member, kwargs)
         return agent, created
 
     def retrieve_or_create_anonymous_group(self, member, kwargs):
@@ -125,23 +149,38 @@ class AgentManager(models.Manager):
         if len(member) == 2 and ('account' in member[0] or 'account' in member[1]):
             # If oauth account is in first member
             if 'account' in member[0] and 'OAuth' in member[0]['account']['homePage']:
-                created_oauth_identifier = "anongroup:%s-%s" % (member[0]['account']['name'], member[1]['mbox'])
+                created_oauth_identifier = "anongroup:%s-%s" % (
+                    member[0]['account']['name'], member[1]['mbox'])
                 try:
-                    agent = Agent.objects.get(oauth_identifier=created_oauth_identifier)
+                    agent = Agent.objects.get(
+                        oauth_identifier=created_oauth_identifier)
                     created = False
                 except Agent.DoesNotExist:
-                    agent = Agent.objects.create(**kwargs)
-                    created = True
+                    try:
+                        agent = Agent.objects.create(**kwargs)
+                        created = True
+                    except IntegrityError, ValidationError:
+                        agent = Agent.objects.get(
+                            oauth_identifier=created_oauth_identifier)
+                        created = False
             # If oauth account is in second member
             elif 'account' in member[1] and 'OAuth' in member[1]['account']['homePage']:
-                created_oauth_identifier = "anongroup:%s-%s" % (member[1]['account']['name'], member[0]['mbox'])
+                created_oauth_identifier = "anongroup:%s-%s" % (
+                    member[1]['account']['name'], member[0]['mbox'])
                 try:
-                    agent = Agent.objects.get(oauth_identifier=created_oauth_identifier)
+                    agent = Agent.objects.get(
+                        oauth_identifier=created_oauth_identifier)
                     created = False
                 except Agent.DoesNotExist:
-                    agent = Agent.objects.create(**kwargs)
-                    created = True
-            # Non-oauth anonymous group that has 2 members, one having an account
+                    try:
+                        agent = Agent.objects.create(**kwargs)
+                        created = True
+                    except IntegrityError, ValidationError:
+                        agent = Agent.objects.get(
+                            oauth_identifier=created_oauth_identifier)
+                        created = False
+            # Non-oauth anonymous group that has 2 members, one having an
+            # account
             else:
                 agent = Agent.objects.create(**kwargs)
                 created = True
@@ -149,11 +188,10 @@ class AgentManager(models.Manager):
         else:
             agent = Agent.objects.create(**kwargs)
             created = True
-
         # If it is a newly created anonymous group, add the members
         if created:
             members = [self.retrieve_or_create(**a) for a in member]
-            agent.member.add(*(a for a, c in members))        
+            agent.member.add(*(a for a, c in members))
         return agent, created
 
     def oauth_group(self, **kwargs):
@@ -163,61 +201,56 @@ class AgentManager(models.Manager):
         except Agent.DoesNotExist:
             return Agent.objects.retrieve_or_create(**kwargs)
 
+
 class Agent(models.Model):
     objectType = models.CharField(max_length=6, blank=True, default="Agent")
     name = models.CharField(max_length=100, blank=True)
-    mbox = models.CharField(max_length=128, db_index=True, null=True)
-    mbox_sha1sum = models.CharField(max_length=40, db_index=True, null=True)
-    openid = models.CharField(max_length=MAX_URL_LENGTH, db_index=True, null=True)
-    oauth_identifier = models.CharField(max_length=192, db_index=True, null=True)
-    member = models.ManyToManyField('self', related_name="agents", null=True)
-    canonical_version = models.BooleanField(default=True)
+    mbox = models.CharField(
+        max_length=128, db_index=True, null=True, unique=True)
+    mbox_sha1sum = models.CharField(
+        max_length=40, db_index=True, null=True, unique=True)
+    openid = models.CharField(
+        max_length=MAX_URL_LENGTH, db_index=True, null=True, unique=True)
+    oauth_identifier = models.CharField(
+        max_length=192, db_index=True, null=True, unique=True)
+    member = models.ManyToManyField('self', related_name="agents")
     account_homePage = models.CharField(max_length=MAX_URL_LENGTH, null=True)
     account_name = models.CharField(max_length=50, null=True)
+    user = models.OneToOneField(User, on_delete=models.SET_NULL, null=True)
     objects = AgentManager()
 
     class Meta:
-        unique_together = (("mbox", "canonical_version"), ("mbox_sha1sum", "canonical_version"),
-            ("openid", "canonical_version"),("oauth_identifier", "canonical_version"), ("account_homePage", "account_name", "canonical_version"))
+        unique_together = ("account_homePage", "account_name")
 
-    def to_dict(self, format='exact', just_objectType=False):
-        just_id = format == 'ids'
-        ret = {}
-        # add object type if format isn't id,
-        # or if it is a group,
-        # or if it's an object
-        if not just_id or self.objectType == 'Group' or just_objectType:
-            ret['objectType'] = self.objectType
-        if self.name and not just_id:
-            ret['name'] = self.name
+    def to_dict(self, ids_only=False):
+        ret = OrderedDict()
         if self.mbox:
             ret['mbox'] = self.mbox
         if self.mbox_sha1sum:
             ret['mbox_sha1sum'] = self.mbox_sha1sum
         if self.openid:
             ret['openid'] = self.openid
-        
-        ret['account'] = {}
         if self.account_name:
+            ret['account'] = OrderedDict()
             ret['account']['name'] = self.account_name
-
-        if self.account_homePage:
             ret['account']['homePage'] = self.account_homePage
-
-        # If not account, delete it
-        if not ret['account']:
-            del ret['account']
-
         if self.objectType == 'Group':
-            # show members for groups if format isn't 'ids'
-            # show members' ids for anon groups if format is 'ids'
-            if not just_id or not (set(['mbox','mbox_sha1sum','openid','account']) & set(ret.keys())):
-                ret['member'] = [a.to_dict(format) for a in self.member.all()]
+            ret['objectType'] = self.objectType
+            # show members for groups if ids_only is false
+            # show members' ids for anon groups if ids_only is true
+            if not ids_only or not (set(['mbox', 'mbox_sha1sum', 'openid', 'account']) & set(ret.keys())):
+                if self.member.all():
+                    ret['member'] = [a.to_dict(ids_only)
+                                     for a in self.member.all()]
+
+        ret['objectType'] = self.objectType
+        if self.name and not ids_only:
+            ret['name'] = self.name
         return ret
 
     # Used only for /agent GET endpoint (check spec)
     def to_dict_person(self):
-        ret = {}
+        ret = OrderedDict()
         ret['objectType'] = "Person"
         if self.name:
             ret['name'] = [self.name]
@@ -227,17 +260,12 @@ class Agent(models.Model):
             ret['mbox_sha1sum'] = [self.mbox_sha1sum]
         if self.openid:
             ret['openid'] = [self.openid]
-
-        ret['account'] = {}
         if self.account_name:
-            ret['account']['name'] = self.account_name
-
-        if self.account_homePage:
-            ret['account']['homePage'] = self.account_homePage
-
-        if not ret['account']:
-            del ret['account']
-
+            ret['account'] = []
+            acc = OrderedDict()
+            acc['name'] = self.account_name
+            acc['homePage'] = self.account_homePage
+            ret['account'].append(acc)
         return ret
 
     def get_a_name(self):
@@ -249,13 +277,12 @@ class Agent(models.Model):
             return self.mbox_sha1sum
         if self.openid:
             return self.openid
-        try:
+        if self.account_name:
             return self.account_name
-        except:
-            if self.objectType == 'Agent':
-                return "unknown"
-            else:
-                return "anonymous group"
+        if self.objectType == 'Agent':
+            return "unknown"
+        else:
+            return "anonymous group"
 
     def get_user_from_oauth_group(self):
         if self.oauth_identifier:
@@ -266,303 +293,192 @@ class Agent(models.Model):
         return None
 
     def __unicode__(self):
-        return json.dumps(self.to_dict())
+        return json.dumps(self.to_dict(), sort_keys=False)
 
-class AgentProfile(models.Model):
-    profileId = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
-    updated = models.DateTimeField(auto_now_add=True, blank=True)
-    agent = models.ForeignKey(Agent)
-    profile = models.FileField(upload_to=AGENT_PROFILE_UPLOAD_TO, null=True)
-    json_profile = models.TextField(blank=True)
-    content_type = models.CharField(max_length=255,blank=True)
-    etag = models.CharField(max_length=50,blank=True)
-
-    def delete(self, *args, **kwargs):
-        if self.profile:
-            self.profile.delete()
-        super(AgentProfile, self).delete(*args, **kwargs)
 
 class Activity(models.Model):
-    activity_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
-    objectType = models.CharField(max_length=8,blank=True, default="Activity")
-    activity_definition_name = JSONField(default={}, blank=True)
-    activity_definition_description = JSONField(default={}, blank=True)
-    activity_definition_type = models.CharField(max_length=MAX_URL_LENGTH, blank=True)
-    activity_definition_moreInfo = models.CharField(max_length=MAX_URL_LENGTH, blank=True)
-    activity_definition_interactionType = models.CharField(max_length=25, blank=True)    
-    activity_definition_extensions = JSONField(default={}, blank=True)
-    activity_definition_crpanswers = JSONField(default={}, blank=True)
-    activity_definition_choices = JSONField(default={}, blank=True)
-    activity_definition_scales = JSONField(default={}, blank=True)
-    activity_definition_sources = JSONField(default={}, blank=True)
-    activity_definition_targets = JSONField(default={}, blank=True)
-    activity_definition_steps = JSONField(default={}, blank=True)
+    activity_id = models.CharField(
+        max_length=MAX_URL_LENGTH, db_index=True, unique=True)
+    canonical_data = JSONField(default=dict)
     authority = models.ForeignKey(Agent, null=True)
-    canonical_version = models.BooleanField(default=True)
 
-    def add_interaction_type(self, i_type, ret, lang):
-        if i_type == 'scale':
-            interactions = self.activity_definition_scales
-        elif i_type == 'choices':
-            interactions = self.activity_definition_choices
-        elif i_type == 'steps':
-            interactions = self.activity_definition_steps
-        elif i_type == 'source':
-            interactions = self.activity_definition_sources
-        elif i_type == 'target':
-            interactions = self.activity_definition_targets
-
-        for i in interactions:
-            i['description'] = util.get_lang(i['description'], lang)
-            ret['definition'][i_type].append(i)        
-
-    def to_dict(self, lang=None, format='exact'):
-        ret = {}
-        ret['id'] = self.activity_id
-        if format != 'ids':
-            ret['objectType'] = self.objectType
-            
-            ret['definition'] = {}
-            if self.activity_definition_name:
-                ret['definition']['name'] = util.get_lang(self.activity_definition_name, lang)
-
-            if self.activity_definition_description:
-                ret['definition']['description'] = util.get_lang(self.activity_definition_description, lang)                      
-
-            if self.activity_definition_type:
-                ret['definition']['type'] = self.activity_definition_type
-            
-            if self.activity_definition_moreInfo != '':
-                ret['definition']['moreInfo'] = self.activity_definition_moreInfo
-
-            if self.activity_definition_interactionType != '':
-                ret['definition']['interactionType'] = self.activity_definition_interactionType
-
-            # Get answers
-            if self.activity_definition_crpanswers:
-                ret['definition']['correctResponsesPattern'] = self.activity_definition_crpanswers
-            
-            if self.activity_definition_scales:
-                ret['definition']['scale'] = []
-                self.add_interaction_type('scale', ret, lang)
-
-            if self.activity_definition_choices:
-                ret['definition']['choices'] = []
-                self.add_interaction_type('choices', ret, lang)
-
-            if self.activity_definition_steps:
-                ret['definition']['steps'] = []
-                self.add_interaction_type('steps', ret, lang)
-
-            if self.activity_definition_sources:
-                ret['definition']['source'] = []
-                self.add_interaction_type('source', ret, lang)
-
-            if self.activity_definition_targets:
-                ret['definition']['target'] = []
-                self.add_interaction_type('target', ret, lang)
-
-            if self.activity_definition_extensions:
-                ret['definition']['extensions'] = self.activity_definition_extensions
-
-            if not ret['definition']:
-                del ret['definition']
-
+    def return_activity_with_lang_format(self, lang=None, ids_only=False):
+        if ids_only:
+            return {'id': self.activity_id}
+        ret = self.canonical_data
+        if 'objectType' not in self.canonical_data:
+            ret['objectType'] = 'Activity'
+        if 'definition' in self.canonical_data:
+            if 'name' in ret['definition'] and ret['definition']['name'].items():
+                ret['definition']['name'] = get_lang(
+                    ret['definition']['name'], lang)
+            if 'description' in ret['definition'] and ret['definition']['description'].items():
+                ret['definition']['description'] = get_lang(
+                    ret['definition']['description'], lang)
+            if 'scale' in ret['definition']:
+                for s in ret['definition']['scale']:
+                    if s.items():
+                        s['description'] = get_lang(s['description'], lang)
+            if 'choices' in ret['definition']:
+                for c in ret['definition']['choices']:
+                    if c.items():
+                        c['description'] = get_lang(c['description'], lang)
+            if 'steps' in ret['definition']:
+                for st in ret['definition']['steps']:
+                    if st.items:
+                        st['description'] = get_lang(st['description'], lang)
+            if 'source' in ret['definition']:
+                for so in ret['definition']['source']:
+                    if so.items:
+                        so['description'] = get_lang(so['description'], lang)
+                for t in ret['definition']['target']:
+                    if t.items():
+                        t['description'] = get_lang(t['description'], lang)
         return ret
 
     def get_a_name(self):
-        return self.activity_definition_name.get('en-US', self.activity_id)
+        if 'definition' in self.canonical_data:
+            return self.canonical_data['definition'].get('en-US', self.activity_id)
+        else:
+            return self.activity_id
 
     def __unicode__(self):
-        return json.dumps(self.to_dict())
+        return json.dumps(self.canonical_data, sort_keys=False)
 
-class StatementRef(models.Model):
-    object_type = models.CharField(max_length=12, default="StatementRef")
-    ref_id = models.CharField(max_length=40)
-
-    def to_dict(self):
-        ret = {}
-        ret['objectType'] = "StatementRef"
-        ret['id'] = self.ref_id
-        return ret
-
-    def get_a_name(self):
-        s = Statement.objects.get(statement_id=self.ref_id)
-        return s.get_object().get_a_name()
-        
-class SubStatementContextActivity(models.Model):
-    key = models.CharField(max_length=8)
-    context_activity = models.ManyToManyField(Activity)
-    substatement = models.ForeignKey('SubStatement')
-
-    def to_dict(self, lang=None, format='exact'):
-        ret = {}
-        ret[self.key] = {}
-        ret[self.key] = [a.to_dict(lang, format) for a in self.context_activity.all()]
-        return ret
-
-class StatementContextActivity(models.Model):
-    key = models.CharField(max_length=8)
-    context_activity = models.ManyToManyField(Activity)
-    statement = models.ForeignKey('Statement')
-
-    def to_dict(self, lang=None, format='exact'):
-        ret = {}
-        ret[self.key] = {}
-        ret[self.key] = [a.to_dict(lang, format) for a in self.context_activity.all()]
-        return ret
-
-class ActivityState(models.Model):
-    state_id = models.CharField(max_length=MAX_URL_LENGTH)
-    updated = models.DateTimeField(auto_now_add=True, blank=True, db_index=True)
-    state = models.FileField(upload_to=ACTIVITY_STATE_UPLOAD_TO, null=True)
-    json_state = models.TextField(blank=True)
-    agent = models.ForeignKey(Agent, db_index=True)
-    activity_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
-    registration_id = models.CharField(max_length=40)
-    content_type = models.CharField(max_length=255,blank=True)
-    etag = models.CharField(max_length=50,blank=True)
-
-    def delete(self, *args, **kwargs):
-        if self.state:
-            self.state.delete()
-        super(ActivityState, self).delete(*args, **kwargs)
-
-class ActivityProfile(models.Model):
-    profileId = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
-    updated = models.DateTimeField(auto_now_add=True, blank=True, db_index=True)
-    activityId = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
-    profile = models.FileField(upload_to=ACTIVITY_PROFILE_UPLOAD_TO, null=True)
-    json_profile = models.TextField(blank=True)
-    content_type = models.CharField(max_length=255,blank=True)
-    etag = models.CharField(max_length=50,blank=True)
-
-    def delete(self, *args, **kwargs):
-        if self.profile:
-            self.profile.delete()
-        super(ActivityProfile, self).delete(*args, **kwargs)
 
 class SubStatement(models.Model):
-    object_agent = models.ForeignKey(Agent, related_name="object_of_substatement", on_delete=models.SET_NULL, null=True, db_index=True)
-    object_activity = models.ForeignKey(Activity, related_name="object_of_substatement", on_delete=models.SET_NULL, null=True, db_index=True)
-    object_statementref = models.ForeignKey(StatementRef, related_name="object_of_substatement", on_delete=models.SET_NULL, null=True, db_index=True)    
-    actor = models.ForeignKey(Agent,related_name="actor_of_substatement", null=True, on_delete=models.SET_NULL)
+    object_agent = models.ForeignKey(
+        Agent, related_name="object_of_substatement", on_delete=models.SET_NULL, null=True, db_index=True)
+    object_activity = models.ForeignKey(
+        Activity, related_name="object_of_substatement", on_delete=models.SET_NULL, null=True, db_index=True)
+    object_statementref = models.UUIDField(
+        null=True, editable=False, db_index=True)
+    actor = models.ForeignKey(
+        Agent, related_name="actor_of_substatement", null=True, on_delete=models.SET_NULL)
     verb = models.ForeignKey(Verb, null=True, on_delete=models.SET_NULL)
     result_success = models.NullBooleanField()
     result_completion = models.NullBooleanField()
     result_response = models.TextField(blank=True)
-    # Made charfield since it would be stored in ISO8601 duration format
     result_duration = models.CharField(max_length=40, blank=True)
     result_score_scaled = models.FloatField(blank=True, null=True)
     result_score_raw = models.FloatField(blank=True, null=True)
     result_score_min = models.FloatField(blank=True, null=True)
     result_score_max = models.FloatField(blank=True, null=True)
-    result_extensions = JSONField(default={}, blank=True)
-    timestamp = models.DateTimeField(blank=True,null=True,
-        default=lambda: datetime.utcnow().replace(tzinfo=utc).isoformat())
-    context_registration = models.CharField(max_length=40, blank=True, db_index=True)
-    context_instructor = models.ForeignKey(Agent,blank=True, null=True, on_delete=models.SET_NULL,
-        db_index=True, related_name='substatement_context_instructor')
-    context_team = models.ForeignKey(Agent,blank=True, null=True, on_delete=models.SET_NULL,
-        related_name="substatement_context_team")
+    result_extensions = JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(null=True)
+    context_registration = models.CharField(
+        max_length=40, blank=True, db_index=True)
+    context_instructor = models.ForeignKey(Agent, blank=True, null=True, on_delete=models.SET_NULL,
+                                           db_index=True, related_name='substatement_context_instructor')
+    context_team = models.ForeignKey(Agent, blank=True, null=True, on_delete=models.SET_NULL,
+                                     related_name="substatement_context_team")
     context_revision = models.TextField(blank=True)
-    context_platform = models.CharField(max_length=50,blank=True)
-    context_language = models.CharField(max_length=50,blank=True)
-    context_extensions = JSONField(default={}, blank=True)
+    context_platform = models.CharField(max_length=50, blank=True)
+    context_language = models.CharField(max_length=50, blank=True)
+    context_extensions = JSONField(default=dict, blank=True)
+    context_ca_parent = models.ManyToManyField(
+        Activity, related_name="sub_context_ca_parent")
+    context_ca_grouping = models.ManyToManyField(
+        Activity, related_name="sub_context_ca_grouping")
+    context_ca_category = models.ManyToManyField(
+        Activity, related_name="sub_context_ca_category")
+    context_ca_other = models.ManyToManyField(
+        Activity, related_name="sub_context_ca_other")
     # context also has a stmt field which is a statementref
     context_statement = models.CharField(max_length=40, blank=True)
-    
-    def to_dict(self, lang=None, format='exact'):
-        ret = {}
-        ret['actor'] = self.actor.to_dict(format)
-        ret['verb'] = self.verb.to_dict()
+
+    def to_dict(self, lang=None, ids_only=False):
+        ret = OrderedDict()
+        ret['actor'] = self.actor.to_dict(ids_only)
+        ret['verb'] = self.verb.return_verb_with_lang(lang, ids_only)
 
         if self.object_agent:
-            ret['object'] = self.object_agent.to_dict(format, just_objectType=True)
+            ret['object'] = self.object_agent.to_dict(ids_only)
         elif self.object_activity:
-            if not self.object_activity.canonical_version:
-                ret['object'] = Activity.objects.get(activity_id=self.object_activity.activity_id, canonical_version=True).to_dict(lang, format)
-            else:
-                ret['object'] = self.object_activity.to_dict(lang, format)
+            ret['object'] = self.object_activity.return_activity_with_lang_format(
+                lang, ids_only)
         else:
-            ret['object'] = self.object_statementref.to_dict()
+            ret['object'] = {
+                'id': str(self.object_statementref), 'objectType': 'StatementRef'}
 
-        ret['result'] = {}
-        if self.result_success != None:
+        ret['result'] = OrderedDict()
+        if self.result_success is not None:
             ret['result']['success'] = self.result_success
-
-        if self.result_completion != None:
+        if self.result_completion is not None:
             ret['result']['completion'] = self.result_completion
-
         if self.result_response:
             ret['result']['response'] = self.result_response
-
         if self.result_duration:
             ret['result']['duration'] = self.result_duration
 
-        ret['result']['score'] = {}
-        if not self.result_score_scaled is None:
+        ret['result']['score'] = OrderedDict()
+        if self.result_score_scaled is not None:
             ret['result']['score']['scaled'] = self.result_score_scaled
-
-        if not self.result_score_raw is None:
+        if self.result_score_raw is not None:
             ret['result']['score']['raw'] = self.result_score_raw
-
-        if not self.result_score_min is None:
+        if self.result_score_min is not None:
             ret['result']['score']['min'] = self.result_score_min
-
-        if not self.result_score_max is None:
+        if self.result_score_max is not None:
             ret['result']['score']['max'] = self.result_score_max
-
         # If there is no score, delete from dict
         if not ret['result']['score']:
             del ret['result']['score']
-
         if self.result_extensions:
             ret['result']['extensions'] = self.result_extensions
-
         # If no result, delete from dict
         if not ret['result']:
             del ret['result']
 
-        ret['context'] = {}
+        ret['context'] = OrderedDict()
         if self.context_registration:
             ret['context']['registration'] = self.context_registration
-
         if self.context_instructor:
-            ret['context']['instructor'] = self.context_instructor.to_dict(format)
-
+            ret['context'][
+                'instructor'] = self.context_instructor.to_dict(ids_only)
         if self.context_team:
-            ret['context']['team'] = self.context_team.to_dict(format)
-
+            ret['context']['team'] = self.context_team.to_dict(ids_only)
         if self.context_revision:
             ret['context']['revision'] = self.context_revision
-
         if self.context_platform:
             ret['context']['platform'] = self.context_platform
-
         if self.context_language:
             ret['context']['language'] = self.context_language
-
         if self.context_statement:
-            ret['context']['statement'] = {'id': self.context_statement, 'objectType': 'StatementRef'}
+            ret['context']['statement'] = {
+                'id': self.context_statement, 'objectType': 'StatementRef'}
 
-        if self.substatementcontextactivity_set.all():
-            ret['context']['contextActivities'] = {}
-            for con_act in self.substatementcontextactivity_set.all():
-                ret['context']['contextActivities'].update(con_act.to_dict(lang, format))
-
+        ret['context']['contextActivities'] = OrderedDict()
+        if self.context_ca_parent.all():
+            ret['context']['contextActivities']['parent'] = [cap.return_activity_with_lang_format(
+                lang, ids_only) for cap in self.context_ca_parent.all()]
+        if self.context_ca_grouping.all():
+            ret['context']['contextActivities']['grouping'] = [cag.return_activity_with_lang_format(
+                lang, ids_only) for cag in self.context_ca_grouping.all()]
+        if self.context_ca_category.all():
+            ret['context']['contextActivities']['category'] = [cac.return_activity_with_lang_format(
+                lang, ids_only) for cac in self.context_ca_category.all()]
+        if self.context_ca_other.all():
+            ret['context']['contextActivities']['other'] = [cao.return_activity_with_lang_format(
+                lang, ids_only) for cao in self.context_ca_other.all()]
         if self.context_extensions:
             ret['context']['extensions'] = self.context_extensions
-
+        if not ret['context']['contextActivities']:
+            del ret['context']['contextActivities']
         if not ret['context']:
             del ret['context']
 
-        ret['timestamp'] = str(self.timestamp)
+        if self.timestamp:
+            ret['timestamp'] = self.timestamp.isoformat()
         ret['objectType'] = "SubStatement"
         return ret
 
     def get_a_name(self):
-        return self.get_object().get_a_name()
+        if self.object_activity:
+            return self.object_activity.get_a_name()
+        elif self.object_agent:
+            return self.object_agent.get_a_name()
+        else:
+            return str(self.object_statementref)
 
     def get_object(self):
         if self.object_activity:
@@ -570,199 +486,163 @@ class SubStatement(models.Model):
         elif self.object_agent:
             stmt_object = self.object_agent
         else:
-            stmt_object = self.object_statementref
+            stmt_object = {
+                'id': str(self.object_statementref), 'objectType': 'StatementRef'}
         return stmt_object
 
-    def delete(self, *args, **kwargs):
-        if self.object_statementref:
-            self.object_statementref.delete()
-        
-        super(SubStatement, self).delete(*args, **kwargs)
+    def __unicode__(self):
+        return json.dumps(self.to_dict(), sort_keys=False)
 
-class StatementAttachment(models.Model):
-    usageType = models.CharField(max_length=MAX_URL_LENGTH)
-    contentType = models.CharField(max_length=128)
-    length = models.PositiveIntegerField()
-    sha2 = models.CharField(max_length=128, blank=True)
-    fileUrl = models.CharField(max_length=MAX_URL_LENGTH, blank=True)
-    payload = models.FileField(upload_to=STATEMENT_ATTACHMENT_UPLOAD_TO, null=True)
-    display = JSONField(default={}, blank=True)
-    description = JSONField(default={}, blank=True)
-
-    def to_dict(self, lang=None):
-        ret = {}
-        ret['usageType'] = self.usageType
-
-        if self.display:
-            if lang:
-                ret['display'] = util.get_lang(self.display, lang)
-            else:
-                first = self.display.iteritems().next()
-                ret['display'] = {first[0]:first[1]}
-
-        if self.description:
-            if lang:
-                ret['description'] = util.get_lang(self.description, lang)
-            else:
-                first = self.description.iteritems().next()
-                ret['description'] = {first[0]:first[1]}
-
-        ret['contentType'] = self.contentType
-        ret['length'] = self.length
-
-        if self.sha2:
-            ret['sha2'] = self.sha2
-
-        if self.fileUrl:
-            ret['fileUrl'] = self.fileUrl
-        return ret
 
 class Statement(models.Model):
     # If no statement_id is given, will create one automatically
-    statement_id = UUIDField(version=1, db_index=True, unique=True)
-    object_agent = models.ForeignKey(Agent, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)
-    object_activity = models.ForeignKey(Activity, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)
-    object_substatement = models.ForeignKey(SubStatement, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)
-    object_statementref = models.ForeignKey(StatementRef, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)    
-    actor = models.ForeignKey(Agent,related_name="actor_statement", db_index=True, null=True,
-        on_delete=models.SET_NULL)
+    statement_id = models.UUIDField(
+        default=uuid.uuid4, db_index=True, editable=False)
+    object_agent = models.ForeignKey(
+        Agent, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)
+    object_activity = models.ForeignKey(
+        Activity, related_name="object_of_statement", null=True, on_delete=models.SET_NULL, db_index=True)
+    object_substatement = models.ForeignKey(
+        SubStatement, related_name="object_of_statement", null=True, on_delete=models.SET_NULL)
+    object_statementref = models.UUIDField(
+        null=True, editable=False, db_index=True)
+    actor = models.ForeignKey(Agent, related_name="actor_statement", db_index=True, null=True,
+                              on_delete=models.SET_NULL)
     verb = models.ForeignKey(Verb, null=True, on_delete=models.SET_NULL)
     result_success = models.NullBooleanField()
     result_completion = models.NullBooleanField()
     result_response = models.TextField(blank=True)
-    # Made charfield since it would be stored in ISO8601 duration format
     result_duration = models.CharField(max_length=40, blank=True)
     result_score_scaled = models.FloatField(blank=True, null=True)
     result_score_raw = models.FloatField(blank=True, null=True)
     result_score_min = models.FloatField(blank=True, null=True)
     result_score_max = models.FloatField(blank=True, null=True)
-    result_extensions = JSONField(default={}, blank=True)
-    # If no stored or timestamp given - will create automatically (only happens if using StatementManager directly)
-    stored = models.DateTimeField(default=datetime.utcnow().replace(tzinfo=utc).isoformat(), db_index=True)
-    timestamp = models.DateTimeField(default=datetime.utcnow().replace(tzinfo=utc).isoformat(), db_index=True)
-    authority = models.ForeignKey(Agent, blank=True,null=True,related_name="authority_statement", db_index=True,
-        on_delete=models.SET_NULL)
+    result_extensions = JSONField(default=dict, blank=True)
+    stored = models.DateTimeField(default=timezone.now, db_index=True)
+    timestamp = models.DateTimeField(db_index=True)
+    authority = models.ForeignKey(Agent, blank=True, null=True, related_name="authority_statement", db_index=True,
+                                  on_delete=models.SET_NULL)
     voided = models.NullBooleanField(default=False)
-    context_registration = models.CharField(max_length=40, blank=True, db_index=True)
-    context_instructor = models.ForeignKey(Agent,blank=True, null=True, on_delete=models.SET_NULL,
-        db_index=True, related_name='statement_context_instructor')
-    context_team = models.ForeignKey(Agent,blank=True, null=True, on_delete=models.SET_NULL,
-        related_name="statement_context_team")
+    context_registration = models.CharField(
+        max_length=40, blank=True, db_index=True)
+    context_instructor = models.ForeignKey(Agent, blank=True, null=True, on_delete=models.SET_NULL,
+                                           db_index=True, related_name='statement_context_instructor')
+    context_team = models.ForeignKey(Agent, blank=True, null=True, on_delete=models.SET_NULL,
+                                     related_name="statement_context_team")
     context_revision = models.TextField(blank=True)
-    context_platform = models.CharField(max_length=50,blank=True)
-    context_language = models.CharField(max_length=50,blank=True)
-    context_extensions = JSONField(default={}, blank=True)
+    context_platform = models.CharField(max_length=50, blank=True)
+    context_language = models.CharField(max_length=50, blank=True)
+    context_extensions = JSONField(default=dict, blank=True)
+    context_ca_parent = models.ManyToManyField(
+        Activity, related_name="stmt_context_ca_parent")
+    context_ca_grouping = models.ManyToManyField(
+        Activity, related_name="stmt_context_ca_grouping")
+    context_ca_category = models.ManyToManyField(
+        Activity, related_name="stmt_context_ca_category")
+    context_ca_other = models.ManyToManyField(
+        Activity, related_name="stmt_context_ca_other")
     # context also has a stmt field which is a statementref
     context_statement = models.CharField(max_length=40, blank=True)
     version = models.CharField(max_length=7)
-    attachments = models.ManyToManyField(StatementAttachment)
     # Used in views
     user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, db_index=True, on_delete=models.SET_NULL)
     full_statement = JSONField()
-    
-    def to_dict(self, lang=None, format='exact'):
-        if format == 'exact':
+
+    def to_dict(self, lang=None, ret_format='exact'):
+        ret = OrderedDict()
+        if ret_format == 'exact':
             return self.full_statement
-        ret = {}
-        ret['id'] = self.statement_id
-        ret['actor'] = self.actor.to_dict(format)
-        ret['verb'] = self.verb.to_dict()
+
+        ids_only = True if ret_format == 'ids' else False
+        ret['id'] = str(self.statement_id)
+        ret['actor'] = self.actor.to_dict(ids_only)
+        ret['verb'] = self.verb.return_verb_with_lang(lang, ids_only)
 
         if self.object_agent:
-            ret['object'] = self.object_agent.to_dict(format, just_objectType=True)            
+            ret['object'] = self.object_agent.to_dict(ids_only)
         elif self.object_activity:
-            if not self.object_activity.canonical_version:
-                ret['object'] = Activity.objects.get(activity_id=self.object_activity.activity_id, canonical_version=True).to_dict(lang, format)
-            else:
-                ret['object'] = self.object_activity.to_dict(lang, format)
+            ret['object'] = self.object_activity.return_activity_with_lang_format(
+                lang, ids_only)
         elif self.object_substatement:
-            ret['object'] = self.object_substatement.to_dict(lang, format)
+            ret['object'] = self.object_substatement.to_dict(lang, ids_only)
         else:
-            ret['object'] = self.object_statementref.to_dict()
+            ret['object'] = {
+                'id': str(self.object_statementref), 'objectType': 'StatementRef'}
 
-        ret['result'] = {}
-        if self.result_success != None:
+        ret['result'] = OrderedDict()
+        if self.result_success is not None:
             ret['result']['success'] = self.result_success
-
-        if self.result_completion != None:
+        if self.result_completion is not None:
             ret['result']['completion'] = self.result_completion
-
         if self.result_response:
             ret['result']['response'] = self.result_response
-
         if self.result_duration:
             ret['result']['duration'] = self.result_duration
 
-        ret['result']['score'] = {}
-        if not self.result_score_scaled is None:
+        ret['result']['score'] = OrderedDict()
+        if self.result_score_scaled is not None:
             ret['result']['score']['scaled'] = self.result_score_scaled
-
-        if not self.result_score_raw is None:
+        if self.result_score_raw is not None:
             ret['result']['score']['raw'] = self.result_score_raw
-
-        if not self.result_score_min is None:
+        if self.result_score_min is not None:
             ret['result']['score']['min'] = self.result_score_min
-
-        if not self.result_score_max is None:
+        if self.result_score_max is not None:
             ret['result']['score']['max'] = self.result_score_max
-
         # If there is no score, delete from dict
         if not ret['result']['score']:
             del ret['result']['score']
-
         if self.result_extensions:
             ret['result']['extensions'] = self.result_extensions
-
         if not ret['result']:
             del ret['result']
 
-        ret['context'] = {}
+        ret['context'] = OrderedDict()
         if self.context_registration:
             ret['context']['registration'] = self.context_registration
-
         if self.context_instructor:
-            ret['context']['instructor'] = self.context_instructor.to_dict(format)
-
+            ret['context'][
+                'instructor'] = self.context_instructor.to_dict(ids_only)
         if self.context_team:
-            ret['context']['team'] = self.context_team.to_dict(format)
-
+            ret['context']['team'] = self.context_team.to_dict(ids_only)
         if self.context_revision:
             ret['context']['revision'] = self.context_revision
-
         if self.context_platform:
             ret['context']['platform'] = self.context_platform
-
         if self.context_language:
             ret['context']['language'] = self.context_language
-
         if self.context_statement:
-            ret['context']['statement'] = {'id': self.context_statement, 'objectType': 'StatementRef'}
+            ret['context']['statement'] = {
+                'id': self.context_statement, 'objectType': 'StatementRef'}
 
-        if self.statementcontextactivity_set.all():
-            ret['context']['contextActivities'] = {}
-            for con_act in self.statementcontextactivity_set.all():
-                ret['context']['contextActivities'].update(con_act.to_dict(lang, format))
-
+        ret['context']['contextActivities'] = OrderedDict()
+        if self.context_ca_parent.all():
+            ret['context']['contextActivities']['parent'] = [cap.return_activity_with_lang_format(
+                lang, ids_only) for cap in self.context_ca_parent.all()]
+        if self.context_ca_grouping.all():
+            ret['context']['contextActivities']['grouping'] = [cag.return_activity_with_lang_format(
+                lang, ids_only) for cag in self.context_ca_grouping.all()]
+        if self.context_ca_category.all():
+            ret['context']['contextActivities']['category'] = [cac.return_activity_with_lang_format(
+                lang, ids_only) for cac in self.context_ca_category.all()]
+        if self.context_ca_other.all():
+            ret['context']['contextActivities']['other'] = [cao.return_activity_with_lang_format(
+                lang, ids_only) for cao in self.context_ca_other.all()]
         if self.context_extensions:
             ret['context']['extensions'] = self.context_extensions
-
+        if not ret['context']['contextActivities']:
+            del ret['context']['contextActivities']
         if not ret['context']:
             del ret['context']
 
         ret['timestamp'] = self.timestamp.isoformat()
         ret['stored'] = self.stored.isoformat()
-        
-        if not self.authority is None:
-            ret['authority'] = self.authority.to_dict(format)
-        
+        if self.authority is not None:
+            ret['authority'] = self.authority.to_dict(ids_only)
         ret['version'] = self.version
-
-        if self.attachments.all():
-            ret['attachments'] = [a.to_dict(lang) for a in self.attachments.all()]
+        if self.stmt_attachments.all():
+            ret['attachments'] = [a.return_attachment_with_lang(
+                lang) for a in self.stmt_attachments.all()]
         return ret
-
-    def unvoid_statement(self):
-        Statement.objects.filter(statement_id=self.object_statementref.ref_id).update(voided=False)        
 
     def get_a_name(self):
         return self.statement_id
@@ -775,19 +655,129 @@ class Statement(models.Model):
         elif self.object_substatement:
             stmt_object = self.object_substatement
         else:
-            stmt_object = self.object_statementref
+            stmt_object = {
+                'id': str(self.object_statementref), 'objectType': 'StatementRef'}
         return stmt_object
 
-    def delete(self, *args, **kwargs):        
-        # Unvoid stmt if verb is voided
-        if self.verb.verb_id == 'http://adlnet.gov/expapi/verbs/voided':
-            self.unvoid_statement()
-        
-        # If sub or ref, FK will be set to null, then call delete
-        if self.verb.verb_id != 'http://adlnet.gov/expapi/verbs/voided':
-            if self.object_substatement:
-                self.object_substatement.delete()
-            elif self.object_statementref:
-                self.object_statementref.delete()
+    def __unicode__(self):
+        return json.dumps(self.to_dict(), sort_keys=False)
 
-        super(Statement, self).delete(*args, **kwargs)
+
+class AttachmentFileSystemStorage(FileSystemStorage):
+
+    def get_available_name(self, name, max_length=None):
+        return name
+
+    def _save(self, name, content, max_length=None):
+        if self.exists(name):
+            # if the file exists, do not call the superclasses _save method
+            return name
+        # if the file is new, DO call it
+        return super(AttachmentFileSystemStorage, self)._save(name, content)
+
+
+class StatementAttachment(models.Model):
+    canonical_data = JSONField(default=dict)
+    payload = models.FileField(max_length=150, upload_to=STATEMENT_ATTACHMENT_UPLOAD_TO,
+                               storage=AttachmentFileSystemStorage(), null=True)
+    statement = models.ForeignKey(
+        Statement, related_name="stmt_attachments", null=True)
+
+    def return_attachment_with_lang(self, lang=None):
+        ret = OrderedDict(self.canonical_data)
+        if 'display' in ret and ret['display'].items():
+            ret['display'] = get_lang(self.canonical_data['display'], lang)
+        if 'description' in ret and ret['description'].items():
+            ret['description'] = get_lang(
+                self.canonical_data['description'], lang)
+        return ret
+
+    def __unicode__(self):
+        return json.dumps(self.canonical_data, sort_keys=False)
+
+
+class ActivityState(models.Model):
+    state_id = models.CharField(max_length=MAX_URL_LENGTH)
+    updated = models.DateTimeField(
+        auto_now_add=True, blank=True, db_index=True)
+    activity_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
+    registration_id = models.CharField(max_length=40, db_index=True)
+    content_type = models.CharField(max_length=255, blank=True)
+    etag = models.CharField(max_length=50, blank=True)
+    agent = models.ForeignKey(Agent)
+    json_state = JSONField(default=dict)
+    state = models.FileField(upload_to=ACTIVITY_STATE_UPLOAD_TO, null=True)
+
+    def delete(self, *args, **kwargs):
+        if self.state:
+            self.state.delete()
+        super(ActivityState, self).delete(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        if self.json_state and isinstance(self.json_state, basestring):
+            try:
+                json.loads(self.json_state)
+            except Exception:
+                try:
+                    ast.literal_eval(self.json_state)
+                except Exception:
+                    raise BadRequest("The Activity State body is not valid JSON")
+        elif self.json_state and not isinstance(self.json_state, basestring):
+            raise BadRequest("The Activity State body is not valid JSON")
+        super(ActivityState, self).save(*args, **kwargs)
+
+class ActivityProfile(models.Model):
+    profile_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
+    updated = models.DateTimeField(
+        auto_now_add=True, blank=True, db_index=True)
+    activity_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
+    content_type = models.CharField(max_length=255, blank=True)
+    etag = models.CharField(max_length=50, blank=True)
+    json_profile = JSONField(default=dict)
+    profile = models.FileField(upload_to=ACTIVITY_PROFILE_UPLOAD_TO, null=True)
+
+    def delete(self, *args, **kwargs):
+        if self.profile:
+            self.profile.delete()
+        super(ActivityProfile, self).delete(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        if self.json_profile and isinstance(self.json_profile, basestring):
+            try:
+                json.loads(self.json_profile)
+            except Exception:
+                try:
+                    ast.literal_eval(self.json_profile)
+                except Exception:
+                    raise BadRequest("The Activity Profile body is not valid JSON")
+        elif self.json_profile and not isinstance(self.json_profile, basestring):
+            raise BadRequest("The Activity Profile body is not valid JSON")
+        super(ActivityProfile, self).save(*args, **kwargs)
+
+class AgentProfile(models.Model):
+    profile_id = models.CharField(max_length=MAX_URL_LENGTH, db_index=True)
+    updated = models.DateTimeField(
+        auto_now_add=True, blank=True, db_index=True)
+    content_type = models.CharField(max_length=255, blank=True)
+    etag = models.CharField(max_length=50, blank=True)
+    agent = models.ForeignKey(Agent, db_index=True)
+    json_profile = JSONField(default=dict)
+    profile = models.FileField(upload_to=AGENT_PROFILE_UPLOAD_TO, null=True)
+
+    def delete(self, *args, **kwargs):
+        if self.profile:
+            self.profile.delete()
+        super(AgentProfile, self).delete(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        if self.json_profile and isinstance(self.json_profile, basestring):
+            try:
+                json.loads(self.json_profile)
+            except Exception:
+                try:
+                    ast.literal_eval(self.json_profile)
+                except Exception:
+                    raise BadRequest("The Agent Profile body is not valid JSON")
+        elif self.json_profile and not isinstance(self.json_profile, basestring):
+            raise BadRequest("The Agent Profile body is not valid JSON")
+        super(AgentProfile, self).save(*args, **kwargs)  

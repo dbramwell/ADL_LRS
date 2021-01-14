@@ -1,30 +1,25 @@
-from django.conf.urls import patterns, include, url
+from django.conf.urls import include, url
+from django.views.generic import RedirectView
 
-urlpatterns = patterns('lrs.views',
-    url(r'^$', 'home'),
-    url(r'^statements/more/(?P<more_id>.{32})$', 'statements_more'),
-    url(r'^statements', 'statements'),
-    url(r'^activities/state', 'activity_state'),
-    url(r'^activities/profile', 'activity_profile'),
-    url(r'^activities', 'activities'),
-    url(r'^agents/profile', 'agent_profile'),
-    url(r'^agents', 'agents'),
-    url(r'^about', 'about'),
+from . import views
+
+urlpatterns = [
+    # redirect for just /xapi
+    url(r'^$', RedirectView.as_view(url='/')),
+
+    # xapi endpoints
+    url(r'^statements/more/(?P<more_id>.{32})$',
+        views.statements_more, name='statements_more'),
+    url(r'^statements/more$', views.statements_more_placeholder,
+        name='statements_more_placeholder'),
+    url(r'^statements$', views.statements, name='statements'),
+    url(r'^activities/state$', views.activity_state, name='activity_state'),
+    url(r'^activities/profile$', views.activity_profile, name='activity_profile'),
+    url(r'^activities$', views.activities, name='activities'),
+    url(r'^agents/profile$', views.agent_profile, name='agent_profile'),
+    url(r'^agents$', views.agents, name='agents'),
+    url(r'^about$', views.about, name='about'),
+
+    # xapi oauth endpoints
     url(r'^OAuth/', include('oauth_provider.urls', namespace='oauth')),
-    # just urls for some user interface and oauth2... not part of xapi
-    url(r'^oauth2/', include('oauth2_provider.provider.oauth2.urls', namespace='oauth2')),    
-    url(r'^register', 'register'),
-    url(r'^regclient2', 'reg_client2'),    
-    url(r'^regclient', 'reg_client'),
-    url(r'^statementvalidator', 'stmt_validator'),
-    url(r'^me/statements', 'my_statements'),
-    url(r'^me/delete/statements', 'my_delete_statements'),
-    url(r'^me/download/statements', 'my_download_statements'),
-    url(r'^me/activities/states', 'my_activity_states'),
-    url(r'^me/activities/state', 'my_activity_state'),
-    url(r'^me/apps', 'my_app_status'),
-    url(r'^me/tokens2', 'delete_token2'),
-    url(r'^me/tokens', 'delete_token'),
-    url(r'^me/clients', 'delete_client'),
-    url(r'^me', 'me')
-)
+]
